@@ -1,195 +1,224 @@
 """
-train.py
---------
-Main training script for the Tox21 Random Forest toxicity model.
+Full training pipeline for the molecular GNN on Tox21.
 
-Pipeline:
-  1. Download / load the Tox21 dataset
-  2. Featurize SMILES -> Morgan fingerprints (radius=2, 2048 bits)
-  3. Split into train (80%) / val (10%) / test (10%)
-  4. Train one Random Forest per toxicity endpoint
-  5. Evaluate on validation set (AUROC, AUPRC, balanced accuracy)
-  6. Evaluate on test set
-  7. Save model and results to disk
-  8. Generate visualizations
-
-Run:
+Usage:
     python src/train.py
+    python src/train.py --epochs 100 --batch-size 64 --hidden-dim 128
 """
 
-import os
+import argparse
+import pathlib
 import sys
-import logging
+import time
+
+import torch
 import numpy as np
-import pandas as pd
+from torch.optim import Adam
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch_geometric.loader import DataLoader
+from sklearn.metrics import roc_auc_score
 
-# Make src/ importable from any working directory
-sys.path.insert(0, os.path.dirname(__file__))
-
-from data_acquisition import load_tox21, download_tox21, inspect_dataset
-from preprocessing import prepare_data
-from model import Tox21RandomForest
-from evaluation import (
+from dataset import load_raw_dataframe, build_dataset, split_dataset, TOX21_TASKS
+from model import MolecularGNN, masked_bce_loss, compute_pos_weights
+from evaluate import (
+    collect_predictions,
     evaluate_predictions,
+    save_metrics,
     plot_auroc_bar,
     plot_roc_curves,
     plot_confusion_matrices,
-    save_metrics,
+    print_metrics_table,
 )
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "results")
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
+MODELS_DIR = pathlib.Path(__file__).parent.parent / "models"
+MODELS_DIR.mkdir(exist_ok=True)
+MODEL_PATH = MODELS_DIR / "tox21_gnn_model.pt"
 
 
-def main():
-    logger.info("=" * 60)
-    logger.info("TOX21 RANDOM FOREST TOXICITY PREDICTION — TRAINING PIPELINE")
-    logger.info("=" * 60)
+# ── Training helpers ─────────────────────────────────────────────────────────
 
-    # ------------------------------------------------------------------
-    # Step 1: Data acquisition
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 1] Acquiring Tox21 dataset...")
-    file_path = download_tox21()
-    df = load_tox21(file_path)
-    inspect_dataset(df)
-
-    # ------------------------------------------------------------------
-    # Step 2: Preprocessing — fingerprints + train/val/test split
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 2] Preprocessing: SMILES -> Morgan fingerprints + split...")
-    data = prepare_data(df, train_frac=0.8, val_frac=0.1, test_frac=0.1, random_state=42)
-
-    X_train = data["X_train"]
-    X_val   = data["X_val"]
-    X_test  = data["X_test"]
-    y_train = data["y_train"]
-    y_val   = data["y_val"]
-    y_test  = data["y_test"]
-    task_names = data["task_names"]
-
-    logger.info(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
-    logger.info(f"X_val  : {X_val.shape},   y_val  : {y_val.shape}")
-    logger.info(f"X_test : {X_test.shape},  y_test : {y_test.shape}")
-
-    # ------------------------------------------------------------------
-    # Step 3: Model training
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 3] Training Random Forest models (one per endpoint)...")
-    model = Tox21RandomForest(task_names=task_names)
-    model.fit(X_train, y_train)
-
-    # ------------------------------------------------------------------
-    # Step 4: Validation set evaluation
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 4] Evaluating on validation set...")
-    y_proba_val = model.predict_proba(X_val)
-    val_metrics = evaluate_predictions(y_val, y_proba_val, task_names, split_name="validation")
-    save_metrics(val_metrics, split_name="validation")
-
-    # Visualizations for validation set
-    plot_auroc_bar(val_metrics, split_name="validation")
-    plot_roc_curves(y_val, y_proba_val, task_names, split_name="validation")
-    plot_confusion_matrices(y_val, y_proba_val, task_names, split_name="validation")
-
-    # ------------------------------------------------------------------
-    # Step 5: Test set evaluation
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 5] Evaluating on test set...")
-    y_proba_test = model.predict_proba(X_test)
-    test_metrics = evaluate_predictions(y_test, y_proba_test, task_names, split_name="test")
-    save_metrics(test_metrics, split_name="test")
-
-    plot_auroc_bar(test_metrics, split_name="test")
-    plot_roc_curves(y_test, y_proba_test, task_names, split_name="test")
-    plot_confusion_matrices(y_test, y_proba_test, task_names, split_name="test")
-
-    # ------------------------------------------------------------------
-    # Step 6: Save model
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 6] Saving model to disk...")
-    model_path = model.save()
-    logger.info(f"Model saved: {model_path}")
-
-    # ------------------------------------------------------------------
-    # Step 7: Quick demo prediction on test set examples
-    # ------------------------------------------------------------------
-    logger.info("\n[Step 7] Demo predictions on 3 test set molecules...")
-    _demo_predictions(model, data["smiles_test"], y_test, task_names)
-
-    # ------------------------------------------------------------------
-    # Step 8: Print final summary
-    # ------------------------------------------------------------------
-    _print_final_summary(val_metrics, test_metrics)
-
-    logger.info("\nTraining pipeline complete!")
-    logger.info(f"Results saved in: {os.path.abspath(RESULTS_DIR)}")
-    logger.info(f"Model saved in:   {os.path.abspath(MODEL_DIR)}")
+def train_epoch(model, loader, optimizer, pos_weight, device):
+    model.train()
+    total_loss = 0.0
+    n_batches = 0
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+        logits = model(batch)
+        loss = masked_bce_loss(logits, batch.y, pos_weight=pos_weight)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        optimizer.step()
+        total_loss += loss.item()
+        n_batches += 1
+    return total_loss / max(n_batches, 1)
 
 
-def _demo_predictions(model, smiles_test, y_test, task_names):
-    """Run and display predictions for 3 molecules from the test set."""
-    from preprocessing import smiles_to_morgan
-
-    n_demo = min(3, len(smiles_test))
-    for idx in range(n_demo):
-        smi = smiles_test[idx]
-        fp = smiles_to_morgan(smi)
-        if fp is None:
-            continue
-
-        X = fp.reshape(1, -1)
-        proba = model.predict_proba(X)[0]
-
-        print(f"\nDemo molecule [{idx+1}]: {smi}")
-        print(f"  {'Endpoint':<18} {'True':>6} {'P(tox)':>8} {'Pred':>6}")
-        print(f"  {'-'*44}")
-        for i, task in enumerate(task_names):
-            true_val = y_test[idx, i]
-            true_str = str(int(true_val)) if not np.isnan(true_val) else " NaN"
-            prob_str = f"{proba[i]:.4f}" if not np.isnan(proba[i]) else "  N/A"
-            pred = 1 if (not np.isnan(proba[i]) and proba[i] >= 0.5) else 0
-            print(f"  {task:<18} {true_str:>6} {prob_str:>8} {pred:>6}")
+def val_auroc(model, loader, device) -> float:
+    """Mean AUROC across tasks with ≥2 label classes."""
+    model.eval()
+    y_true, y_prob = collect_predictions(model, loader, device)
+    aurocs = []
+    for i in range(len(TOX21_TASKS)):
+        known = ~np.isnan(y_true[:, i])
+        yt = y_true[known, i]
+        yp = y_prob[known, i]
+        if len(np.unique(yt)) >= 2:
+            aurocs.append(roc_auc_score(yt, yp))
+    return float(np.mean(aurocs)) if aurocs else 0.0
 
 
-def _print_final_summary(val_metrics: pd.DataFrame, test_metrics: pd.DataFrame) -> None:
-    """Print a final performance summary table."""
-    print("\n" + "=" * 70)
-    print("FINAL PERFORMANCE SUMMARY")
-    print("=" * 70)
+# ── Main pipeline ────────────────────────────────────────────────────────────
 
-    summary = pd.DataFrame({
-        "Endpoint":   val_metrics["Endpoint"],
-        "Val_AUROC":  val_metrics["AUROC"],
-        "Test_AUROC": test_metrics["AUROC"],
-        "Val_AUPRC":  val_metrics["AUPRC"],
-        "Test_AUPRC": test_metrics["AUPRC"],
-    })
-    print(summary.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+def main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\nDevice: {device}")
 
-    valid_val = val_metrics["AUROC"].dropna()
-    valid_test = test_metrics["AUROC"].dropna()
+    # ── 1. Load & featurize ────────────────────────────────────────────
+    print("\n[1/6] Loading and featurizing Tox21 dataset …")
+    df, smiles_col = load_raw_dataframe()
+    print(f"  Loaded {len(df)} molecules from CSV")
 
-    print(f"\n  Mean Validation AUROC: {valid_val.mean():.4f}")
-    print(f"  Mean Test AUROC      : {valid_test.mean():.4f}")
-    print(f"  Val endpoints >= 0.65: {(valid_val >= 0.65).sum()}/{len(valid_val)}")
-    print(f"  Test endpoints >= 0.65: {(valid_test >= 0.65).sum()}/{len(valid_test)}")
+    dataset, invalid = build_dataset(df, smiles_col, verbose=True)
+    print(f"  Valid graphs: {len(dataset)} | Invalid SMILES: {len(invalid)}")
 
-    # Success criterion check
-    n_above_threshold = (valid_test >= 0.65).sum()
-    if n_above_threshold >= 8:
-        print(f"\n  SUCCESS: {n_above_threshold}/12 endpoints achieve AUROC >= 0.65")
-    else:
-        print(f"\n  NOTE: {n_above_threshold}/12 endpoints achieve AUROC >= 0.65 "
-              f"(target: 8/12)")
+    # ── 2. Split ───────────────────────────────────────────────────────
+    print("\n[2/6] Splitting into train / val / test (80 / 10 / 10) …")
+    train_ds, val_ds, test_ds = split_dataset(dataset, seed=args.seed)
+    print(f"  Train: {len(train_ds)} | Val: {len(val_ds)} | Test: {len(test_ds)}")
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False,
+                              num_workers=0)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False,
+                              num_workers=0)
+
+    # ── 3. Class weights ───────────────────────────────────────────────
+    print("\n[3/6] Computing class weights …")
+    pos_weight = compute_pos_weights(train_ds, num_tasks=len(TOX21_TASKS))
+    pos_weight = pos_weight.to(device)
+    for i, (t, w) in enumerate(zip(TOX21_TASKS, pos_weight.cpu().tolist())):
+        print(f"  {t:<18} pos_weight={w:.2f}")
+
+    # ── 4. Model & optimiser ───────────────────────────────────────────
+    print("\n[4/6] Building GNN model …")
+    model = MolecularGNN(
+        hidden_dim=args.hidden_dim,
+        num_heads=args.num_heads,
+        num_layers=args.num_layers,
+        dropout=args.dropout,
+        num_tasks=len(TOX21_TASKS),
+    ).to(device)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Trainable parameters: {n_params:,}")
+    print(f"  Architecture: {args.num_layers} GATv2 layers, "
+          f"hidden={args.hidden_dim}, heads={args.num_heads}")
+
+    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
+                                  patience=10, min_lr=1e-5)
+
+    # ── 5. Training loop ───────────────────────────────────────────────
+    print(f"\n[5/6] Training for up to {args.epochs} epochs "
+          f"(early stop patience={args.patience}) …\n")
+
+    best_val_auroc = 0.0
+    best_epoch = 0
+    patience_counter = 0
+    history = []
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        train_loss = train_epoch(model, train_loader, optimizer, pos_weight, device)
+        v_auroc = val_auroc(model, val_loader, device)
+        scheduler.step(v_auroc)
+        elapsed = time.time() - t0
+
+        history.append({"epoch": epoch, "train_loss": train_loss, "val_auroc": v_auroc})
+
+        improved = v_auroc > best_val_auroc
+        if improved:
+            best_val_auroc = v_auroc
+            best_epoch = epoch
+            patience_counter = 0
+            torch.save({
+                "model_state_dict": model.state_dict(),
+                "args": vars(args),
+                "epoch": epoch,
+                "val_auroc": v_auroc,
+            }, MODEL_PATH)
+        else:
+            patience_counter += 1
+
+        marker = " *" if improved else ""
+        print(f"  Epoch {epoch:03d}/{args.epochs}  "
+              f"loss={train_loss:.4f}  val_auroc={v_auroc:.4f}  "
+              f"lr={optimizer.param_groups[0]['lr']:.2e}  "
+              f"[{elapsed:.1f}s]{marker}")
+
+        if patience_counter >= args.patience:
+            print(f"\n  Early stopping at epoch {epoch} "
+                  f"(best epoch {best_epoch}, val_auroc={best_val_auroc:.4f})")
+            break
+
+    # ── 6. Evaluate best model ─────────────────────────────────────────
+    print(f"\n[6/6] Loading best model (epoch {best_epoch}) and evaluating …")
+    ckpt = torch.load(MODEL_PATH, map_location=device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+
+    for split, loader in [("validation", val_loader), ("test", test_loader)]:
+        print(f"\n  ── {split.upper()} ──")
+        y_true, y_prob = collect_predictions(model, loader, device)
+        metrics_df = evaluate_predictions(y_true, y_prob)
+        print_metrics_table(metrics_df, split)
+        save_metrics(metrics_df, split)
+        plot_auroc_bar(metrics_df, split)
+        plot_roc_curves(y_true, y_prob, split)
+        plot_confusion_matrices(y_true, y_prob, split)
+
+    # ── Summary ────────────────────────────────────────────────────────
+    import pandas as pd
+    val_df  = pd.read_csv(pathlib.Path(__file__).parent.parent / "results" / "metrics_validation.csv")
+    test_df = pd.read_csv(pathlib.Path(__file__).parent.parent / "results" / "metrics_test.csv")
+
+    val_mean  = val_df["AUROC"].mean()
+    test_mean = test_df["AUROC"].mean()
+    val_above = (val_df["AUROC"] >= 0.65).sum()
+    test_above = (test_df["AUROC"] >= 0.65).sum()
+
+    print("\n" + "═"*55)
+    print("  FINAL SUMMARY — GNN Toxicity Predictor")
+    print("═"*55)
+    print(f"  Model         : GATv2 ({args.num_layers} layers, h={args.hidden_dim})")
+    print(f"  Best epoch    : {best_epoch} / {args.epochs}")
+    print(f"  Val  AUROC    : {val_mean:.4f}  ({val_above}/12 ≥ 0.65)")
+    print(f"  Test AUROC    : {test_mean:.4f}  ({test_above}/12 ≥ 0.65)")
+    print(f"  Model saved   : {MODEL_PATH}")
+    print("═"*55)
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train GNN on Tox21")
+    p.add_argument("--epochs",       type=int,   default=150)
+    p.add_argument("--batch-size",   type=int,   default=64)
+    p.add_argument("--hidden-dim",   type=int,   default=128)
+    p.add_argument("--num-heads",    type=int,   default=4)
+    p.add_argument("--num-layers",   type=int,   default=3)
+    p.add_argument("--dropout",      type=float, default=0.2)
+    p.add_argument("--lr",           type=float, default=1e-3)
+    p.add_argument("--weight-decay", type=float, default=1e-5)
+    p.add_argument("--patience",     type=int,   default=25)
+    p.add_argument("--seed",         type=int,   default=42)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    main(args)

@@ -1,225 +1,187 @@
 """
-predict.py
-----------
-Prediction interface for the Tox21 Random Forest toxicity model.
+Inference interface: load a trained GNN and predict toxicity from SMILES.
 
-Usage:
-    from src.predict import predict_toxicity, load_model
+Usage (CLI demo):
+    python src/predict.py
 
-    result = predict_toxicity("CCO")  # ethanol
-    for endpoint, info in result.items():
-        print(f"{endpoint}: {'TOXIC' if info['prediction'] == 1 else 'non-toxic'} "
-              f"(p={info['probability']:.3f})")
+Usage (API):
+    from predict import load_model, predict_toxicity, batch_predict
+    model, device = load_model()
+    result = predict_toxicity("CCO", model, device)
 """
 
-import os
-import logging
-import numpy as np
-from rdkit import Chem, RDLogger
+import pathlib
+from typing import Optional
 
-RDLogger.DisableLog("rdApp.*")
-logger = logging.getLogger(__name__)
+import torch
+from torch_geometric.loader import DataLoader
 
-MODEL_DIR = os.path.join(os.path.dirname(__file__), "..", "models")
-DEFAULT_MODEL_PATH = os.path.join(MODEL_DIR, "tox21_rf_model.joblib")
+from featurization import smiles_to_graph
+from model import MolecularGNN
+from dataset import TOX21_TASKS
 
-
-def _smiles_to_fingerprint(smiles: str, radius: int = 2, n_bits: int = 2048) -> np.ndarray | None:
-    """Convert a SMILES string to a Morgan fingerprint array."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        return None
-
-    from rdkit.Chem import AllChem
-    from rdkit.DataStructs import ConvertToNumpyArray
-
-    fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=n_bits)
-    arr = np.zeros(n_bits, dtype=np.uint8)
-    ConvertToNumpyArray(fp, arr)
-    return arr
+MODELS_DIR = pathlib.Path(__file__).parent.parent / "models"
+DEFAULT_MODEL_PATH = MODELS_DIR / "tox21_gnn_model.pt"
 
 
-def load_model(model_path: str = DEFAULT_MODEL_PATH):
-    """
-    Load the trained Tox21RandomForest model from disk.
+def load_model(
+    model_path: pathlib.Path = DEFAULT_MODEL_PATH,
+    device: Optional[torch.device] = None,
+) -> tuple[MolecularGNN, torch.device]:
+    """Load a trained GNN from a checkpoint file."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    Args:
-        model_path : Path to a .joblib model file.
+    ckpt = torch.load(model_path, map_location=device)
+    args = ckpt.get("args", {})
 
-    Returns:
-        Loaded Tox21RandomForest instance.
-    """
-    import sys
-    sys.path.insert(0, os.path.dirname(__file__))
-    from model import Tox21RandomForest
+    model = MolecularGNN(
+        hidden_dim=args.get("hidden_dim", 128),
+        num_heads=args.get("num_heads", 4),
+        num_layers=args.get("num_layers", 3),
+        dropout=args.get("dropout", 0.2),
+        num_tasks=len(TOX21_TASKS),
+    ).to(device)
 
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(
-            f"Model not found at: {model_path}\n"
-            f"Run 'python src/train.py' first to train and save the model."
-        )
-    return Tox21RandomForest.load(model_path)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    print(f"Loaded model from {model_path}  (epoch {ckpt.get('epoch','?')}, "
+          f"val_auroc={ckpt.get('val_auroc', 0.0):.4f})")
+    return model, device
 
 
 def predict_toxicity(
-    smiles_string: str,
-    model=None,
-    model_path: str = DEFAULT_MODEL_PATH,
+    smiles: str,
+    model: MolecularGNN,
+    device: torch.device,
     threshold: float = 0.5,
 ) -> dict:
     """
-    Predict toxicity for a single molecule given as a SMILES string.
+    Predict toxicity for a single SMILES string.
 
-    Args:
-        smiles_string : SMILES representation of the molecule.
-        model         : Pre-loaded Tox21RandomForest (optional, loaded from disk if None).
-        model_path    : Path to the model file (used if model is None).
-        threshold     : Probability threshold for binary classification.
-
-    Returns:
-        dict mapping endpoint name -> {
-            "prediction"  : int  (1 = toxic, 0 = non-toxic, -1 = no model),
-            "probability" : float (P(toxic), NaN if no model),
-            "label"       : str  ("TOXIC", "non-toxic", or "unknown"),
-        }
-
-    Raises:
-        ValueError : If the SMILES string is invalid.
+    Returns a dict with:
+      - 'smiles': input SMILES
+      - 'valid': bool (False if SMILES could not be parsed)
+      - per-task entries: {'prediction': int, 'probability': float, 'label': str}
     """
-    # Validate SMILES
-    fp = _smiles_to_fingerprint(smiles_string)
-    if fp is None:
-        raise ValueError(f"Invalid SMILES string: {smiles_string!r}")
+    graph = smiles_to_graph(smiles)
+    if graph is None:
+        return {"smiles": smiles, "valid": False}
 
-    # Load model if not provided
-    if model is None:
-        model = load_model(model_path)
+    graph = graph.to(device)
 
-    # Predict — reshape to (1, n_bits) for single sample
-    X = fp.reshape(1, -1)
-    proba = model.predict_proba(X)  # shape (1, n_tasks)
-    preds = model.predict(X, threshold=threshold)  # shape (1, n_tasks)
+    # Add batch dimension (single graph)
+    graph.batch = torch.zeros(graph.num_nodes, dtype=torch.long, device=device)
 
-    results = {}
-    for i, task in enumerate(model.task_names):
-        prob = proba[0, i]
-        pred = preds[0, i]
+    with torch.no_grad():
+        logits = model(graph)
+        probs = torch.sigmoid(logits).squeeze(0).cpu().tolist()
 
-        if np.isnan(prob):
-            label = "unknown"
-        elif pred == 1:
-            label = "TOXIC"
-        else:
-            label = "non-toxic"
-
-        results[task] = {
-            "prediction": int(pred),
-            "probability": float(prob) if not np.isnan(prob) else None,
-            "label": label,
+    result = {"smiles": smiles, "valid": True}
+    for task, prob in zip(TOX21_TASKS, probs):
+        pred = int(prob >= threshold)
+        result[task] = {
+            "prediction": pred,
+            "probability": round(prob, 4),
+            "label": "TOXIC" if pred == 1 else "non-toxic",
         }
-
-    return results
+    return result
 
 
 def batch_predict(
     smiles_list: list[str],
-    model=None,
-    model_path: str = DEFAULT_MODEL_PATH,
+    model: MolecularGNN,
+    device: torch.device,
+    batch_size: int = 64,
     threshold: float = 0.5,
 ) -> list[dict]:
-    """
-    Predict toxicity for multiple SMILES strings in a batch.
-
-    Skips invalid SMILES and logs warnings.
-
-    Args:
-        smiles_list : List of SMILES strings.
-        model       : Pre-loaded Tox21RandomForest (loaded from disk if None).
-        model_path  : Path to the model file.
-        threshold   : Probability threshold.
-
-    Returns:
-        List of dicts, one per valid input SMILES. Each dict has keys:
-        "smiles", "valid", and (if valid) all endpoint predictions.
-    """
-    if model is None:
-        model = load_model(model_path)
-
-    results = []
-    valid_fps = []
-    valid_smiles = []
-    invalid_indices = []
-
+    """Predict toxicity for a list of SMILES strings."""
+    # Build graphs
+    graphs, valid_idx, invalid_smiles = [], [], []
     for i, smi in enumerate(smiles_list):
-        fp = _smiles_to_fingerprint(smi)
-        if fp is not None:
-            valid_fps.append(fp)
-            valid_smiles.append(smi)
+        g = smiles_to_graph(smi)
+        if g is not None:
+            g.smiles = smi
+            graphs.append(g)
+            valid_idx.append(i)
         else:
-            logger.warning(f"Invalid SMILES at index {i}: {smi!r}")
-            invalid_indices.append(i)
+            invalid_smiles.append((i, smi))
 
-    if not valid_fps:
-        return [{"smiles": s, "valid": False} for s in smiles_list]
+    results = [None] * len(smiles_list)
+    for idx, smi in invalid_smiles:
+        results[idx] = {"smiles": smi, "valid": False}
 
-    X = np.vstack(valid_fps)
-    proba = model.predict_proba(X)
-    preds = model.predict(X, threshold=threshold)
+    if not graphs:
+        return results
 
-    valid_results = []
-    for j, smi in enumerate(valid_smiles):
+    loader = DataLoader(graphs, batch_size=batch_size, shuffle=False)
+    model.eval()
+    all_probs = []
+
+    with torch.no_grad():
+        for batch in loader:
+            batch = batch.to(device)
+            logits = model(batch)
+            probs = torch.sigmoid(logits).cpu().tolist()
+            all_probs.extend(probs)
+
+    for i, (orig_idx, probs) in enumerate(zip(valid_idx, all_probs)):
+        smi = smiles_list[orig_idx]
         entry = {"smiles": smi, "valid": True}
-        for k, task in enumerate(model.task_names):
-            prob = proba[j, k]
-            pred = preds[j, k]
+        for task, prob in zip(TOX21_TASKS, probs):
+            pred = int(prob >= threshold)
             entry[task] = {
-                "prediction": int(pred),
-                "probability": float(prob) if not np.isnan(prob) else None,
-                "label": "TOXIC" if pred == 1 else ("non-toxic" if pred != -1 else "unknown"),
+                "prediction": pred,
+                "probability": round(prob, 4),
+                "label": "TOXIC" if pred == 1 else "non-toxic",
             }
-        valid_results.append(entry)
+        results[orig_idx] = entry
 
-    # Reconstruct ordered list (valid + invalid markers)
-    valid_iter = iter(valid_results)
-    output = []
-    invalid_set = set(invalid_indices)
-    vi = 0
-    for i in range(len(smiles_list)):
-        if i in invalid_set:
-            output.append({"smiles": smiles_list[i], "valid": False})
-        else:
-            output.append(next(valid_iter))
-
-    return output
+    return results
 
 
-def print_prediction(smiles: str, result: dict) -> None:
-    """Pretty-print a prediction result for a single molecule."""
-    print(f"\nMolecule: {smiles}")
-    print("-" * 50)
-    print(f"{'Endpoint':<18} {'Label':<12} {'P(toxic)':>10}")
-    print("-" * 50)
-    for endpoint, info in result.items():
-        prob_str = f"{info['probability']:.4f}" if info["probability"] is not None else "  N/A  "
-        print(f"  {endpoint:<16} {info['label']:<12} {prob_str:>10}")
-    print("-" * 50)
+def print_prediction(result: dict):
+    """Pretty-print a single prediction result."""
+    smi = result["smiles"]
+    print(f"\nSMILES: {smi}")
+    if not result.get("valid", True):
+        print("  ✗  Invalid SMILES — could not parse molecule")
+        return
+    print(f"  {'Endpoint':<18} {'Prob':>6}  {'Label'}")
+    print(f"  {'-'*40}")
+    for task in TOX21_TASKS:
+        t = result[task]
+        marker = "⚠" if t["prediction"] == 1 else " "
+        print(f"  {marker} {task:<16} {t['probability']:>6.4f}  {t['label']}")
+
+
+# ── Demo ─────────────────────────────────────────────────────────────────────
+
+DEMO_SMILES = [
+    ("Ethanol",       "CCO"),
+    ("Aspirin",       "CC(=O)Oc1ccccc1C(=O)O"),
+    ("Bisphenol A",   "CC(C)(c1ccc(O)cc1)c1ccc(O)cc1"),
+    ("Dioxin (TCDD)", "Clc1cc2oc3cc(Cl)c(Cl)cc3oc2cc1Cl"),
+    ("Tamoxifen",     "CCC(=C(c1ccccc1)c1ccc(OCCN(C)C)cc1)c1ccccc1"),
+]
 
 
 if __name__ == "__main__":
-    # Demo: test on a few known molecules
-    test_molecules = [
-        ("CCO", "Ethanol"),
-        ("c1ccccc1", "Benzene"),
-        ("CC(=O)Oc1ccccc1C(=O)O", "Aspirin"),
-        ("ClC(Cl)(Cl)Cl", "Carbon tetrachloride"),
-        ("CCOC(=O)c1ccc(N)cc1", "Benzocaine"),
-    ]
+    if not DEFAULT_MODEL_PATH.exists():
+        print(f"No trained model found at {DEFAULT_MODEL_PATH}")
+        print("Run:  python src/train.py")
+        raise SystemExit(1)
 
-    print("Loading model...")
-    model = load_model()
+    model, device = load_model()
 
-    for smiles, name in test_molecules:
-        print(f"\n{'='*50}")
-        print(f"Compound: {name}")
-        result = predict_toxicity(smiles, model=model)
-        print_prediction(smiles, result)
+    print("\n" + "="*55)
+    print("  Molecular Toxicity Predictions (GNN)")
+    print("="*55)
+
+    for name, smi in DEMO_SMILES:
+        print(f"\n{'─'*55}")
+        print(f"  Compound: {name}")
+        result = predict_toxicity(smi, model, device)
+        print_prediction(result)
+
+    print(f"\n{'='*55}")
