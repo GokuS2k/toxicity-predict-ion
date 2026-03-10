@@ -1,0 +1,26 @@
+# Tox21 Phase 2 — GNN Toxicity Prediction
+# Install with: pip install -r requirements.txt
+
+# Core deep learning
+torch>=2.0.0
+torch-geometric>=2.4.0
+
+# Chemistry
+rdkit>=2022.9.1
+
+# Machine learning & evaluation
+scikit-learn>=1.3.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Optional: Chemprop D-MPNN (alternative to manual D-MPNN implementation)
+# chemprop>=2.0.0

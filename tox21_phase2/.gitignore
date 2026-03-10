@@ -1,0 +1,14 @@
+# Model checkpoints (large files)
+models/*.pt
+models/chemprop_best/
+
+# Results (generated at runtime)
+results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
