@@ -117,6 +117,13 @@ class DMPNNModel(nn.Module):
         # i.e., reverse_idx[k] = k ^ 1
 
         num_edges = edge_index.size(1)
+        # Sanity check: edges must come in directed pairs (i→j at 2k, j→i at 2k+1).
+        # Single-atom self-loops must also be doubled in featurization.py.
+        assert num_edges % 2 == 0, (
+            f"D-MPNN requires an even number of directed edges (got {num_edges}). "
+            "Ensure every molecule's edge list uses directed pairs, including "
+            "self-loops on single-atom molecules."
+        )
         reverse_idx = torch.arange(num_edges, device=x.device)
         reverse_idx = reverse_idx ^ 1  # XOR with 1 flips last bit: 0↔1, 2↔3, ...
 

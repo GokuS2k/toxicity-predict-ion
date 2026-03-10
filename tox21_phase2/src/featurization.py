@@ -125,10 +125,15 @@ def smiles_to_graph(smiles: str) -> Data | None:
         edge_feat_list += [feat, feat]
 
     if not src_list:
-        # Single-atom molecule: add self-loop so GATv2 can propagate
-        src_list = [0]
-        dst_list = [0]
-        edge_feat_list = [np.zeros(NUM_EDGE_FEATURES, dtype=np.float32)]
+        # Single-atom molecule: add TWO self-loop edges so the total edge
+        # count stays even. The D-MPNN uses reverse_idx = k ^ 1 (XOR-1),
+        # which assumes edges come in directed pairs (k, k^1). A single
+        # self-loop would make the batch edge count odd and cause an
+        # IndexError when the last edge tries to access index == size.
+        self_feat = np.zeros(NUM_EDGE_FEATURES, dtype=np.float32)
+        src_list = [0, 0]
+        dst_list = [0, 0]
+        edge_feat_list = [self_feat, self_feat]
 
     edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
     edge_attr  = torch.tensor(np.stack(edge_feat_list), dtype=torch.float)
