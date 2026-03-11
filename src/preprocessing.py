@@ -273,6 +273,28 @@ def _scaffold_split_indices(
         else:
             test_idx.extend(group)
 
+    # Safety fallback: if any split ended up empty (can happen when a small
+    # number of very large scaffold groups consume the full dataset quota),
+    # donate the last scaffold-group's worth of indices from the largest
+    # non-empty split so every split has at least 1 sample.
+    min_split = 10  # keep at least this many molecules per split
+    if len(test_idx) < min_split and len(val_idx) >= min_split * 2:
+        transfer = val_idx[-min_split:]
+        val_idx  = val_idx[:-min_split]
+        test_idx = transfer + test_idx
+        logger.warning(
+            f"Test split was too small; moved {min_split} molecules "
+            f"from val → test as a safety fallback."
+        )
+    if len(val_idx) < min_split and len(train_idx) >= min_split * 2:
+        transfer  = train_idx[-min_split:]
+        train_idx = train_idx[:-min_split]
+        val_idx   = transfer + val_idx
+        logger.warning(
+            f"Val split was too small; moved {min_split} molecules "
+            f"from train → val as a safety fallback."
+        )
+
     logger.info(
         f"Scaffold split: {len(scaffold_to_indices)} unique scaffolds → "
         f"Train {len(train_idx)} ({len(train_idx)/n:.1%}), "

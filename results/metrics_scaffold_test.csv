@@ -1,0 +1,13 @@
+Endpoint,AUROC,AUPRC,Balanced_Acc,N_samples,N_positive,N_negative
+NR-AR,,,,7,0,7
+NR-AR-LBD,,,,5,0,5
+NR-AhR,1.0,1.0,1.0,7,2,5
+NR-Aromatase,0.8,0.5833,0.5,7,2,5
+NR-ER,0.4,0.25,0.5,6,1,5
+NR-ER-LBD,0.625,0.7,0.5,6,2,4
+NR-PPAR-gamma,0.5,0.7,0.5,5,2,3
+SR-ARE,0.5,0.7,0.5833,5,2,3
+SR-ATAD5,,,,7,0,7
+SR-HSE,,,,6,0,6
+SR-MMP,,,,3,0,3
+SR-p53,1.0,1.0,0.5,6,4,2
