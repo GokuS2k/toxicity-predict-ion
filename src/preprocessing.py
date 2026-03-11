@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit import RDLogger
 from sklearn.model_selection import train_test_split
 
@@ -108,6 +109,7 @@ def prepare_data(
     val_frac: float = 0.1,
     test_frac: float = 0.1,
     random_state: int = 42,
+    split_type: str = "random",
 ) -> dict:
     """
     Full preprocessing pipeline: SMILES -> fingerprints -> train/val/test splits.
@@ -118,6 +120,8 @@ def prepare_data(
         val_frac     : Fraction of data for validation.
         test_frac    : Fraction of data for testing.
         random_state : Random seed for reproducibility.
+        split_type   : 'random' for stratified random split (default) or
+                       'scaffold' for Murcko scaffold-based split.
 
     Returns:
         dict with keys: X_train, X_val, X_test, y_train, y_val, y_test,
@@ -126,6 +130,8 @@ def prepare_data(
     """
     assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-6, \
         "Fractions must sum to 1.0"
+    assert split_type in ("random", "scaffold"), \
+        f"split_type must be 'random' or 'scaffold', got '{split_type}'"
 
     smiles_col = find_smiles_column(df)
     label_cols = [c for c in TOX21_TASKS if c in df.columns]
@@ -150,38 +156,41 @@ def prepare_data(
     logger.info(f"Missing label rate: {np.isnan(Y).mean():.1%}")
 
     # --- Step 2: Train/Val/Test split ---
-    # We do an 80/20 first split, then split the 20% into val/test (50/50).
-    # Stratification uses the first label column with enough positives.
-    stratify_col = _get_stratify_column(Y, label_cols)
+    if split_type == "scaffold":
+        logger.info("Using Murcko scaffold-based split...")
+        train_idx, val_idx, test_idx = _scaffold_split_indices(
+            smiles_valid, train_frac, val_frac, test_frac, random_state
+        )
+    else:
+        # Random stratified split:
+        # 80/20 first, then split the 20% into val/test (50/50).
+        stratify_col = _get_stratify_column(Y, label_cols)
+        val_test_frac = val_frac + test_frac
+        indices = np.arange(len(X))
 
-    # Primary split: train vs (val+test)
-    val_test_frac = val_frac + test_frac
-    indices = np.arange(len(X))
-
-    if stratify_col is not None:
-        logger.info(f"Stratified split using endpoint: '{stratify_col[1]}'")
-        strat_labels = stratify_col[0]
-        try:
-            train_idx, valtest_idx = train_test_split(
-                indices, test_size=val_test_frac,
-                stratify=strat_labels, random_state=random_state
-            )
-        except ValueError:
-            logger.warning("Stratified split failed, falling back to random split.")
+        if stratify_col is not None:
+            logger.info(f"Stratified split using endpoint: '{stratify_col[1]}'")
+            strat_labels = stratify_col[0]
+            try:
+                train_idx, valtest_idx = train_test_split(
+                    indices, test_size=val_test_frac,
+                    stratify=strat_labels, random_state=random_state
+                )
+            except ValueError:
+                logger.warning("Stratified split failed, falling back to random split.")
+                train_idx, valtest_idx = train_test_split(
+                    indices, test_size=val_test_frac, random_state=random_state
+                )
+        else:
+            logger.warning("No suitable stratification column found. Using random split.")
             train_idx, valtest_idx = train_test_split(
                 indices, test_size=val_test_frac, random_state=random_state
             )
-    else:
-        logger.warning("No suitable stratification column found. Using random split.")
-        train_idx, valtest_idx = train_test_split(
-            indices, test_size=val_test_frac, random_state=random_state
-        )
 
-    # Secondary split: val vs test (equal halves of the 20%)
-    val_share = val_frac / val_test_frac  # e.g., 0.5
-    val_idx, test_idx = train_test_split(
-        valtest_idx, test_size=(1 - val_share), random_state=random_state
-    )
+        val_share = val_frac / val_test_frac  # e.g., 0.5
+        val_idx, test_idx = train_test_split(
+            valtest_idx, test_size=(1 - val_share), random_state=random_state
+        )
 
     logger.info(
         f"Split sizes — Train: {len(train_idx)}, "
@@ -203,6 +212,74 @@ def prepare_data(
 
     _log_split_summary(result)
     return result
+
+
+def _scaffold_split_indices(
+    smiles: np.ndarray,
+    train_frac: float,
+    val_frac: float,
+    test_frac: float,
+    random_state: int,
+) -> tuple[list, list, list]:
+    """
+    Split molecule indices by Murcko scaffold so no scaffold appears in more
+    than one split (avoids data leakage).
+
+    Strategy:
+      1. Compute the generic Murcko scaffold for every molecule.
+      2. Group molecule indices by scaffold.
+      3. Shuffle scaffold groups with `random_state` for reproducibility.
+      4. Greedily assign groups to train until train_frac is reached,
+         then to val until val_frac is reached, remainder to test.
+
+    Molecules whose SMILES cannot be parsed fall back to using the raw
+    SMILES string as a unique "scaffold" (keeps them isolated in one split).
+    """
+    n = len(smiles)
+
+    # Build scaffold → [indices] map
+    scaffold_to_indices: dict[str, list[int]] = {}
+    for i, smi in enumerate(smiles):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            scaffold = smi  # unique fallback
+        else:
+            scaffold = MurckoScaffold.MurckoScaffoldSmiles(
+                mol=mol, includeChirality=False
+            )
+        scaffold_to_indices.setdefault(scaffold, []).append(i)
+
+    # Sort by scaffold group size (largest first) so big scaffold families
+    # land in train, then shuffle to avoid ordering bias.
+    scaffold_groups = sorted(
+        scaffold_to_indices.values(), key=len, reverse=True
+    )
+    rng = np.random.RandomState(random_state)
+    order = rng.permutation(len(scaffold_groups))
+    scaffold_groups = [scaffold_groups[i] for i in order]
+
+    train_target = train_frac * n
+    val_target = val_frac * n
+
+    train_idx: list[int] = []
+    val_idx: list[int] = []
+    test_idx: list[int] = []
+
+    for group in scaffold_groups:
+        if len(train_idx) < train_target:
+            train_idx.extend(group)
+        elif len(val_idx) < val_target:
+            val_idx.extend(group)
+        else:
+            test_idx.extend(group)
+
+    logger.info(
+        f"Scaffold split: {len(scaffold_to_indices)} unique scaffolds → "
+        f"Train {len(train_idx)} ({len(train_idx)/n:.1%}), "
+        f"Val {len(val_idx)} ({len(val_idx)/n:.1%}), "
+        f"Test {len(test_idx)} ({len(test_idx)/n:.1%})"
+    )
+    return train_idx, val_idx, test_idx
 
 
 def _get_stratify_column(Y: np.ndarray, label_cols: list) -> tuple | None:
