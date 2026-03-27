@@ -1,0 +1,12 @@
+2026-03-27 01:31:47 | unimol_tools\data\conformer.py | 182 | INFO | Uni-Mol Tools | Start generating conformers...
+2026-03-27 01:31:48 | unimol_tools\data\conformer.py | 197 | INFO | Uni-Mol Tools | Succeeded in generating conformers for 100.00% of molecules.
+2026-03-27 01:31:48 | unimol_tools\data\conformer.py | 214 | INFO | Uni-Mol Tools | Succeeded in generating 3d conformers for 100.00% of molecules.
+2026-03-27 01:31:48 | unimol_tools\data\datahub.py | 187 | INFO | Uni-Mol Tools | conf_cache_level is 1, saving conformers to ./exp/tiny_test\tiny_tox21.sdf.
+2026-03-27 01:31:48 | unimol_tools\data\datahub.py | 201 | INFO | Uni-Mol Tools | Successfully saved sdf file to ./exp/tiny_test\tiny_tox21.sdf
+2026-03-27 01:31:48 | unimol_tools\data\split.py | 74 | WARNING | Uni-Mol Tools | [93m[93mOnly one fold is used for training, no splitting is performed.[0m[0m
+2026-03-27 01:31:48 | unimol_tools\data\datahub.py | 145 | INFO | Uni-Mol Tools | Kfold is 1, all data is used for training.
+2026-03-27 01:31:48 | unimol_tools\train.py | 307 | INFO | Uni-Mol Tools | Output directory already exists: ./exp/tiny_test
+2026-03-27 01:31:48 | unimol_tools\train.py | 310 | INFO | Uni-Mol Tools | Warning: Overwrite output directory: ./exp/tiny_test
+2026-03-27 01:31:48 | unimol_tools\tasks\trainer.py | 103 | INFO | Uni-Mol Tools | Using CPU.
+2026-03-27 01:31:48 | unimol_tools\models\unimol.py | 167 | INFO | Uni-Mol Tools | Loading pretrained weights from C:\Users\gokul\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\unimol_tools\weights\mol_pre_all_h_220816.pt
+2026-03-27 01:31:49 | unimol_tools\models\nnmodel.py | 174 | INFO | Uni-Mol Tools | start training Uni-Mol:unimolv1

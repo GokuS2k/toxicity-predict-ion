@@ -1,0 +1,13 @@
+2026-03-27 01:52:15 | unimol_tools\data\conformer.py | 182 | INFO | Uni-Mol Tools | Start generating conformers...
+2026-03-27 02:00:23 | unimol_tools\data\conformer.py | 197 | INFO | Uni-Mol Tools | Succeeded in generating conformers for 99.81% of molecules.
+2026-03-27 02:00:23 | unimol_tools\data\conformer.py | 206 | INFO | Uni-Mol Tools | Failed conformers indices: [95, 255, 659, 1422, 1533, 1721, 2146, 2250, 2757, 4020, 4371, 4606, 5935, 6470, 6710]
+2026-03-27 02:00:23 | unimol_tools\data\conformer.py | 214 | INFO | Uni-Mol Tools | Succeeded in generating 3d conformers for 99.17% of molecules.
+2026-03-27 02:00:23 | unimol_tools\data\conformer.py | 223 | INFO | Uni-Mol Tools | Failed 3d conformers indices: [95, 114, 149, 217, 218, 255, 304, 659, 952, 973, 985, 1065, 1217, 1231, 1422, 1533, 1581, 1596, 1721, 1932, 1955, 2146, 2250, 2295, 2499, 2530, 2732, 2757, 2829, 2940, 3241, 3445, 3508, 3791, 4002, 4020, 4280, 4299, 4371, 4488, 4606, 4802, 4863, 4930, 5241, 5292, 5434, 5602, 5710, 5802, 5912, 5935, 6147, 6236, 6470, 6505, 6710, 6712, 6935, 7051, 7312, 7360, 7399, 7490, 7623]
+2026-03-27 02:00:23 | unimol_tools\data\datahub.py | 184 | WARNING | Uni-Mol Tools | [93m[93mconf_cache_level is 1, but C:\Users\gokul\tox\toxicity-predict-ion\tox21_phase3\exp\unimol_v1_scaffold\tox21_prepared.sdf exists, so do not save conformers.[0m[0m
+2026-03-27 02:00:23 | unimol_tools\data\split.py | 74 | WARNING | Uni-Mol Tools | [93m[93mOnly one fold is used for training, no splitting is performed.[0m[0m
+2026-03-27 02:00:23 | unimol_tools\data\datahub.py | 145 | INFO | Uni-Mol Tools | Kfold is 1, all data is used for training.
+2026-03-27 02:00:23 | unimol_tools\train.py | 307 | INFO | Uni-Mol Tools | Output directory already exists: C:\Users\gokul\tox\toxicity-predict-ion\tox21_phase3\exp\unimol_v1_scaffold
+2026-03-27 02:00:23 | unimol_tools\train.py | 310 | INFO | Uni-Mol Tools | Warning: Overwrite output directory: C:\Users\gokul\tox\toxicity-predict-ion\tox21_phase3\exp\unimol_v1_scaffold
+2026-03-27 02:00:23 | unimol_tools\tasks\trainer.py | 103 | INFO | Uni-Mol Tools | Using CPU.
+2026-03-27 02:00:23 | unimol_tools\models\unimol.py | 167 | INFO | Uni-Mol Tools | Loading pretrained weights from C:\Users\gokul\AppData\Local\Packages\PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0\LocalCache\local-packages\Python312\site-packages\unimol_tools\weights\mol_pre_all_h_220816.pt
+2026-03-27 02:00:24 | unimol_tools\models\nnmodel.py | 174 | INFO | Uni-Mol Tools | start training Uni-Mol:unimolv1
